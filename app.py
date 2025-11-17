@@ -1,4 +1,5 @@
 # app.py
+
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
@@ -12,234 +13,175 @@ import pytz
 import warnings
 from geopy.geocoders import Nominatim
 from streamlit_folium import st_folium
+import zipfile
+import os
+
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="대전 안전경로 탐색", layout="wide")
 
-# ----------------------------------------------------
-# 0. CSV → GeoDataFrame
-# ----------------------------------------------------
-def load_point_csv(path):
-    import chardet
-    with open(path, 'rb') as f:
-        enc = chardet.detect(f.read(50000))['encoding']
-    # st.write(f"[INFO] {path} 인코딩 감지 → {enc}")
-
-    df = pd.read_csv(path, encoding=enc)
-
-    cols = df.columns
-
-    # 위경도
-    lat = next((c for c in cols if "lat" in c.lower() or "위도" in c), None)
-    lon = next((c for c in cols if "lon" in c.lower() or "경도" in c), None)
-    if lat and lon:
-        return gpd.GeoDataFrame(
-            df,
-            geometry=gpd.points_from_xy(df[lon], df[lat]),
-            crs="EPSG:4326"
-        )
-
-    # TM 좌표
-    x = next((c for c in cols if c.lower() in ['x','tm_x','tmy_x']), None)
-    y = next((c for c in cols if c.lower() in ['y','tm_y','tmy_y']), None)
-    if x and y:
-        gdf = gpd.GeoDataFrame(
-            df,
-            geometry=gpd.points_from_xy(df[x], df[y]),
-            crs="EPSG:5181"
-        )
-        return gdf.to_crs(4326)
-
-    raise ValueError(f"좌표 열을 찾을 수 없음 → {cols}")
 
 # ----------------------------------------------------
-# 1. 데이터 & 그래프 캐싱 로드
+# 1. 그래프 로드 (ZIP → GraphML) + 시간대별 cost 계산
 # ----------------------------------------------------
 @st.cache_resource
 def load_graph_and_scores():
-    lamps_gdf = load_point_csv("lamps_daejeon.csv")
-    cctv_gdf  = load_point_csv("cctv_daejeon.csv")
-    child_gdf = load_point_csv("child_zone_daejeon.csv")
-    acc_gdf   = load_point_csv("accident_yuseong.csv")
+    # 1) zip 압축 해제
+    zip_path = "daejeon_safe_graph.zip"
+    extract_dir = "graphdata"
 
-    G = ox.graph_from_place("Daejeon, South Korea", network_type="walk")
-    edges = ox.graph_to_gdfs(G, nodes=False)
+    if not os.path.exists(extract_dir):
+        os.makedirs(extract_dir)
 
-    def safe_score_points(src, edges, buf_m=30):
-        e = edges.to_crs(5181).copy()
-        p = src.to_crs(5181)
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(extract_dir)
 
-        e["buf"] = e.geometry.buffer(buf_m)
-        joined = gpd.sjoin(p, e.set_geometry("buf"), predicate="within", how="left")
+    # 2) graphml 불러오기
+    graph_path = os.path.join(extract_dir, "daejeon_safe_graph.graphml")
+    G = ox.load_graphml(graph_path)
 
-        if "index_right" in joined.columns:
-            idx = joined["index_right"]
-        elif isinstance(joined.index, pd.MultiIndex):
-            idx = joined.index.get_level_values(-1)
-        else:
-            idx = pd.Index([])
-
-        cnt = idx.value_counts().reindex(e.index, fill_value=0)
-
-        lengths = e.geometry.length.clip(lower=1.0)
-        density = cnt / (lengths / 100.0)
-        p99 = max(np.percentile(density, 99), 1e-6)
-
-        return (density.clip(0, p99) / p99).fillna(0.0)
-
-    edges_5181 = edges.to_crs(5181).copy()
-    edges_5181["lamp"]  = safe_score_points(lamps_gdf, edges, 30)
-    edges_5181["cctv"]  = safe_score_points(cctv_gdf,  edges, 30)
-    edges_5181["child"] = safe_score_points(child_gdf, edges, 50)
-
-    # 유성구 사고
-    try:
-        yuseong = ox.geocode_to_gdf("Yuseong-gu, Daejeon, South Korea").to_crs(4326)
-        yuseong_poly = yuseong.unary_union
-    except:
-        yuseong_poly = acc_gdf.unary_union.buffer(0.003)
-
-    e = edges_5181.copy()
-    e["buf"] = e.geometry.buffer(50)
-    joined = gpd.sjoin(acc_gdf.to_crs(5181), e.set_geometry("buf"), predicate="within", how="left")
-
-    if "index_right" in joined.columns:
-        idx = joined["index_right"]
-    elif isinstance(joined.index, pd.MultiIndex):
-        idx = joined.index.get_level_values(-1)
-    else:
-        idx = pd.Index([])
-
-    acc_cnt = idx.value_counts().reindex(e.index, fill_value=0)
-    lengths = e.geometry.length.clip(lower=1.0)
-    acc_dens = acc_cnt / (lengths / 100.0)
-
-    inside = e.to_crs(4326).geometry.intersects(yuseong_poly)
-    ys_vals = acc_dens[inside]
-
-    if len(ys_vals) > 0:
-        p99 = max(np.percentile(ys_vals, 99), 1e-6)
-        neutral = np.median(ys_vals[ys_vals > 0]) if (ys_vals > 0).any() else 0
-    else:
-        p99, neutral = 1, 0
-
-    edges_5181["acc"] = acc_dens.clip(0, p99) / p99
-    edges_5181.loc[~inside, "acc"] = neutral / p99
-
+    # 3) 시간대별 가중치로 cost 계산
     now = datetime.now(pytz.timezone("Asia/Seoul"))
     night = (now.hour >= 18 or now.hour < 6)
 
     if night:
+        # 밤: 밝기 / CCTV / 어린이보호구역 / 사고 가중치 ↑
         wL, wC, wZ, wA = 1.5, 1.2, 2.0, 1.3
     else:
+        # 낮: 사고보다는 보호구역 중심
         wL, wC, wZ, wA = 0.7, 1.0, 1.5, 0.8
 
-    edges_5181["safe"] = (
-        wL*edges_5181["lamp"] +
-        wC*edges_5181["cctv"] +
-        wZ*edges_5181["child"]
-    )
-    edges_5181["risk"] = (1 + wA*edges_5181["acc"]) / (1 + edges_5181["safe"])
+    for u, v, k, data in G.edges(keys=True, data=True):
+        lamp  = float(data.get("lamp", 0.0))
+        cctv  = float(data.get("cctv", 0.0))
+        child = float(data.get("child", 0.0))
+        acc   = float(data.get("acc", 0.0))
 
-    edges_final = edges_5181.to_crs(4326)
+        safe = wL * lamp + wC * cctv + wZ * child
+        risk = (1 + wA * acc) / (1 + safe)
 
-    # 그래프에 cost 등록
-    for (u, v, k), r in zip(edges_final.index, edges_final["risk"]):
-        G[u][v][k]["cost"] = float(r)
+        data["cost"] = float(risk)
 
+    # 4) 최근접 노드 계산용 노드 GeoDataFrame
     nodes = ox.graph_to_gdfs(G, nodes=True, edges=False)
     nodes_proj = nodes.to_crs(5181)
 
     return G, nodes, nodes_proj
 
+
 G, nodes, nodes_proj = load_graph_and_scores()
+
 
 # ----------------------------------------------------
 # 2. 지오코딩 + 최근접 노드
 # ----------------------------------------------------
-geocode = Nominatim(user_agent="safe_route").geocode
+geocode = Nominatim(user_agent="safe_route_daejeon").geocode
 
-def is_latlon(s):
+
+def is_latlon(s: str) -> bool:
     if "," not in s:
         return False
-    a,b = s.split(",",1)
+    a, b = s.split(",", 1)
     try:
-        float(a); float(b)
+        float(a)
+        float(b)
         return True
-    except:
+    except Exception:
         return False
 
-def geocode_robust(q):
+
+def geocode_robust(q: str):
     q = q.strip()
+    # 1) "36.35, 127.38" 형태 숫자면 바로 파싱
     if is_latlon(q):
-        a,b = q.split(",",1)
-        return (float(a), float(b))
+        a, b = q.split(",", 1)
+        return float(a), float(b)
 
+    # 2) 그대로 지오코딩 시도
     loc = geocode(q)
-    if loc: return (loc.latitude, loc.longitude)
+    if loc:
+        return loc.latitude, loc.longitude
 
+    # 3) 대전 붙여서 다시 시도
     loc = geocode(f"{q}, Daejeon, South Korea")
-    if loc: return (loc.latitude, loc.longitude)
+    if loc:
+        return loc.latitude, loc.longitude
 
-    gdf = ox.geocode_to_gdf(f"{q}, Daejeon, South Korea")
-    if len(gdf):
-        c = gdf.geometry.iloc[0].centroid
-        return (float(c.y), float(c.x))
+    # 4) osmnx geocode_to_gdf 사용
+    try:
+        gdf = ox.geocode_to_gdf(f"{q}, Daejeon, South Korea")
+        if len(gdf):
+            c = gdf.geometry.iloc[0].centroid
+            return float(c.y), float(c.x)
+    except Exception:
+        pass
 
-    return (36.351, 127.385)
+    # 5) 완전 실패하면 대전 중심 좌표
+    return 36.351, 127.385
 
-def find_nearest_node(lat, lon):
+
+def find_nearest_node(lat: float, lon: float):
     pt = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(5181).iloc[0]
     dx = nodes_proj.geometry.x - pt.x
     dy = nodes_proj.geometry.y - pt.y
-    dist2 = dx*dx + dy*dy
+    dist2 = dx * dx + dy * dy
     return dist2.idxmin()
+
 
 # ----------------------------------------------------
 # 3. Streamlit UI
 # ----------------------------------------------------
 st.title("🛡️ 대전 안전경로 탐색기")
-st.write("가로등, CCTV, 어린이보호구역, 유성구 사고 데이터를 이용한 시간대별 안전 경로 탐색")
+st.write("가로등·CCTV·어린이보호구역·유성구 사고 데이터를 이용해 시간대별 안전 경로를 탐색합니다.")
 
-# 이전 경로 결과를 보관할 공간
+# 이전 경로 결과 보관
 if "route_result" not in st.session_state:
     st.session_state["route_result"] = None
 
 col1, col2 = st.columns(2)
+
 with col1:
     orig_in = st.text_input(
         "출발지 (주소 또는 위도,경도)",
         "대전광역시청",
-        help='예: "대전광역시 서구 둔산동" 또는 "36.351, 127.385"'
+        help='예: "대전광역시 서구 둔산동" 또는 "36.351, 127.385"',
     )
+
 with col2:
     dest_in = st.text_input(
         "도착지 (주소 또는 위도,경도)",
         "충남대학교",
-        help='예: "대전광역시 유성구 궁동" 또는 "36.366, 127.343"'
+        help='예: "대전광역시 유성구 궁동" 또는 "36.366, 127.343"',
     )
 
 if st.button("✅ 안전 경로 찾기"):
-    with st.spinner("경로 탐색 중입니다... (조금만 기다려 주세요)"):
-        orig_latlon = geocode_robust(orig_in)
-        dest_latlon = geocode_robust(dest_in)
+    with st.spinner("경로 탐색 중입니다..."):
+        try:
+            orig_latlon = geocode_robust(orig_in)
+            dest_latlon = geocode_robust(dest_in)
 
-        orig_node = find_nearest_node(orig_latlon[0], orig_latlon[1])
-        dest_node = find_nearest_node(dest_latlon[0], dest_latlon[1])
+            orig_node = find_nearest_node(orig_latlon[0], orig_latlon[1])
+            dest_node = find_nearest_node(dest_latlon[0], dest_latlon[1])
 
-        route = nx.shortest_path(G, orig_node, dest_node, weight="cost")
+            route = nx.shortest_path(G, orig_node, dest_node, weight="cost")
 
-        path_nodes = [G.nodes[n] for n in route]
-        latlons = [(d['y'], d['x']) for d in path_nodes]
+            path_nodes = [G.nodes[n] for n in route]
+            latlons = [(d["y"], d["x"]) for d in path_nodes]
 
-        # 👉 계산된 결과를 session_state에 저장
-        st.session_state["route_result"] = {
-            "path_latlons": latlons,
-            "orig": orig_latlon,
-            "dest": dest_latlon,
-        }
+            st.session_state["route_result"] = {
+                "path_latlons": latlons,
+                "orig": orig_latlon,
+                "dest": dest_latlon,
+            }
+        except nx.NetworkXNoPath:
+            st.error("출발지와 도착지 사이에 도보 경로를 찾을 수 없습니다.")
+        except Exception as e:
+            st.error(f"경로 탐색 중 오류가 발생했습니다: {e}")
 
-# 👉 버튼을 안 눌러도, 이전 결과가 있으면 계속 지도를 그림
+
+# ----------------------------------------------------
+# 4. 지도 표시
+# ----------------------------------------------------
 if st.session_state["route_result"] is not None:
     data = st.session_state["route_result"]
     latlons = data["path_latlons"]
@@ -255,4 +197,4 @@ if st.session_state["route_result"] is not None:
 
     st_folium(m, width=900, height=600)
 else:
-    st.info("왼쪽에 출발지와 도착지를 입력하고 **[✅ 안전 경로 찾기]** 버튼을 눌러 주세요.")
+    st.info("출발지와 도착지를 입력하고 **[✅ 안전 경로 찾기]** 버튼을 눌러 주세요.")
