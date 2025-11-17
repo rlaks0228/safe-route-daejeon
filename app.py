@@ -57,10 +57,10 @@ def load_point_csv(path):
 # ----------------------------------------------------
 @st.cache_resource
 def load_graph_and_scores():
-    lamps_gdf = load_point_csv("대전광역시_가로등 현황_20221201.csv")
-    cctv_gdf  = load_point_csv("daejeon_traffic_cctv.csv")
-    child_gdf = load_point_csv("daejeon_child_zone.csv")
-    acc_gdf   = load_point_csv("대전광역시 유성구_교통사고 현황_20211231.csv")
+    lamps_gdf = load_point_csv("lamps_daejeon.csv")
+    cctv_gdf  = load_point_csv("cctv_daejeon.csv")
+    child_gdf = load_point_csv("child_zone_daejeon.csv")
+    acc_gdf   = load_point_csv("accident_yuseong.csv")
 
     G = ox.graph_from_place("Daejeon, South Korea", network_type="walk")
     edges = ox.graph_to_gdfs(G, nodes=False)
@@ -226,3 +226,4 @@ if st.button("경로 찾기"):
         folium.Marker(dest_latlon, popup="도착지").add_to(m)
 
         st_folium(m, width=900, height=600)
+
