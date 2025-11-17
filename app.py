@@ -201,14 +201,26 @@ def find_nearest_node(lat, lon):
 st.title("🛡️ 대전 안전경로 탐색기")
 st.write("가로등, CCTV, 어린이보호구역, 유성구 사고 데이터를 이용한 시간대별 안전 경로 탐색")
 
+# 이전 경로 결과를 보관할 공간
+if "route_result" not in st.session_state:
+    st.session_state["route_result"] = None
+
 col1, col2 = st.columns(2)
 with col1:
-    orig_in = st.text_input("출발지 주소 또는 'lat,lon'", "대전광역시청")
+    orig_in = st.text_input(
+        "출발지 (주소 또는 위도,경도)",
+        "대전광역시청",
+        help='예: "대전광역시 서구 둔산동" 또는 "36.351, 127.385"'
+    )
 with col2:
-    dest_in = st.text_input("도착지 주소 또는 'lat,lon'", "충남대학교")
+    dest_in = st.text_input(
+        "도착지 (주소 또는 위도,경도)",
+        "충남대학교",
+        help='예: "대전광역시 유성구 궁동" 또는 "36.366, 127.343"'
+    )
 
-if st.button("경로 찾기"):
-    with st.spinner("경로 탐색 중..."):
+if st.button("✅ 안전 경로 찾기"):
+    with st.spinner("경로 탐색 중입니다... (조금만 기다려 주세요)"):
         orig_latlon = geocode_robust(orig_in)
         dest_latlon = geocode_robust(dest_in)
 
@@ -220,10 +232,27 @@ if st.button("경로 찾기"):
         path_nodes = [G.nodes[n] for n in route]
         latlons = [(d['y'], d['x']) for d in path_nodes]
 
-        m = folium.Map(location=[path_nodes[0]['y'], path_nodes[0]['x']], zoom_start=14)
-        folium.PolyLine(latlons, weight=6, opacity=0.7).add_to(m)
-        folium.Marker(orig_latlon, popup="출발지").add_to(m)
-        folium.Marker(dest_latlon, popup="도착지").add_to(m)
+        # 👉 계산된 결과를 session_state에 저장
+        st.session_state["route_result"] = {
+            "path_latlons": latlons,
+            "orig": orig_latlon,
+            "dest": dest_latlon,
+        }
 
-        st_folium(m, width=900, height=600)
+# 👉 버튼을 안 눌러도, 이전 결과가 있으면 계속 지도를 그림
+if st.session_state["route_result"] is not None:
+    data = st.session_state["route_result"]
+    latlons = data["path_latlons"]
+    orig_latlon = data["orig"]
+    dest_latlon = data["dest"]
 
+    center_lat, center_lon = latlons[0]
+
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=14)
+    folium.PolyLine(latlons, weight=6, opacity=0.7).add_to(m)
+    folium.Marker(orig_latlon, popup="출발지").add_to(m)
+    folium.Marker(dest_latlon, popup="도착지").add_to(m)
+
+    st_folium(m, width=900, height=600)
+else:
+    st.info("왼쪽에 출발지와 도착지를 입력하고 **[✅ 안전 경로 찾기]** 버튼을 눌러 주세요.")
