@@ -9,4 +9,5 @@ folium
 shapely
 geopy
 pytz
+requests
 chardet
