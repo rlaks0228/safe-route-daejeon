@@ -1,0 +1,12 @@
+streamlit
+streamlit-folium
+pandas
+geopandas
+numpy
+osmnx
+networkx
+folium
+shapely
+geopy
+pytz
+chardet
