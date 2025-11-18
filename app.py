@@ -28,8 +28,7 @@ st.set_page_config(page_title="대전 안전경로 탐색", layout="wide")
 @st.cache_resource
 def load_graph_and_scores():
     # 1) zip 압축 해제
-    zip_path = "daejeon_safe_graph.zip"
-
+    zip_path = "daejeon_safe_graph.zip"  # 🔹 이 이름의 zip이 repo 루트에 있어야 함
     extract_dir = "graphdata"
 
     if not os.path.exists(extract_dir):
@@ -38,7 +37,7 @@ def load_graph_and_scores():
     with zipfile.ZipFile(zip_path, "r") as z:
         z.extractall(extract_dir)
 
-    # 2) graphml 불러오기 (그래프 파일명은 기존 그대로)
+    # 2) graphml 불러오기
     graph_path = os.path.join(extract_dir, "daejeon_safe_graph.graphml")
     G = ox.load_graphml(graph_path)
 
@@ -62,7 +61,7 @@ def load_graph_and_scores():
         lamp = float(data.get("lamp", 0.0))
         cctv = float(data.get("cctv", 0.0))
         child = float(data.get("child", 0.0))
-        acc = float(data.get("acc", 0.0))  # 현재는 cost에는 사용하지 않지만 통계 계산용으로 남김
+        acc = float(data.get("acc", 0.0))
 
         length_vals.append(length)
         edges_info.append((u, v, k, length, lamp, cctv, child, acc))
@@ -76,17 +75,12 @@ def load_graph_and_scores():
         median_len = 1.0
 
     # 6) cost 계산
-    #    - 기본: cost ≈ (길이 / 중앙길이) / (1 + wL*lamp + wC*cctv + wZ*child)
+    #    - cost ≈ (길이 / 중앙길이) / (1 + wL*lamp + wC*cctv + wZ*child)
     #    - 조명/ CCTV / 보호구역이 많을수록 cost가 작아져서 선호
     for (u, v, k, length, lamp, cctv, child, acc) in edges_info:
         length_factor = length / median_len
-
-        # 클수록 안전한 점수 (조명/ CCTV / 보호구역만 사용)
         safe_score = wL * lamp + wC * cctv + wZ * child
-
-        # 사고 데이터(acc)는 좌표계 문제로 현재 신뢰하기 어려워 cost에서 제외
         cost = length_factor / (1.0 + safe_score)
-
         G[u][v][k]["cost"] = float(cost)
 
     # 7) 최근접 노드 계산용
@@ -100,6 +94,25 @@ G, nodes, nodes_proj = load_graph_and_scores()
 
 
 # ----------------------------------------------------
+# 1-1. 전체 그래프 속성 요약 (사이드바에 표시)
+# ----------------------------------------------------
+def attr_summary_streamlit(G, attr_name: str):
+    vals = [float(d.get(attr_name, 0.0)) for _, _, d in G.edges(data=True)]
+    vals = np.array(vals, dtype=float)
+    if len(vals) == 0:
+        st.sidebar.write(f"{attr_name}: 엣지 없음")
+        return
+    nonzero = int(np.count_nonzero(vals))
+    st.sidebar.write(
+        f"{attr_name}: 0이 아닌 엣지 = {nonzero} / 최솟값 = {vals.min():.3f} / 최댓값 = {vals.max():.3f}"
+    )
+
+st.sidebar.markdown("### 🔍 전체 그래프 속성 요약")
+for name in ["lamp", "cctv", "child", "acc"]:
+    attr_summary_streamlit(G, name)
+
+
+# ----------------------------------------------------
 # 2. 지오코딩 + 최근접 노드
 # ----------------------------------------------------
 
@@ -108,10 +121,7 @@ def geocode_kakao(q: str):
     try:
         url = "https://dapi.kakao.com/v2/local/search/keyword.json"
         headers = {"Authorization": f"KakaoAK {st.secrets['KAKAO_REST_KEY']}"}
-        params = {
-            "query": q,
-            "size": 1,   # 최상단 1개만
-        }
+        params = {"query": q, "size": 1}
         r = requests.get(url, headers=headers, params=params, timeout=3)
         r.raise_for_status()
         data = r.json()
@@ -151,12 +161,12 @@ def geocode_robust(q: str):
         a, b = q.split(",", 1)
         return float(a), float(b)
 
-    # 2) 카카오맵 검색(한글, 오타, 축약 이름에 강함)
+    # 2) 카카오맵 검색
     lat, lon, _ = geocode_kakao(q)
     if lat is not None and lon is not None:
         return lat, lon
 
-    # 3) geopy Nominatim (OSM) 시도 – 실패해도 조용히 넘어감
+    # 3) geopy Nominatim (OSM)
     try:
         loc = geocode(q)
     except Exception:
@@ -164,7 +174,7 @@ def geocode_robust(q: str):
     if loc:
         return loc.latitude, loc.longitude
 
-    # 4) "대전, 한국" 붙여서 다시 시도
+    # 4) "Daejeon, South Korea" 붙여서 다시 시도
     try:
         loc = geocode(f"{q}, Daejeon, South Korea")
     except Exception:
@@ -198,15 +208,6 @@ def find_nearest_node(lat: float, lon: float):
 # ----------------------------------------------------
 
 def compute_route_stats(G: nx.MultiDiGraph, route: list[int]):
-    """
-    한 경로에 대해:
-      - 총 길이 (m)
-      - 사고 위험 노출도 (acc 길이 가중 평균)
-      - 평균 밝기 (lamp 길이 가중 평균)
-      - 평균 CCTV 밀도 (cctv 길이 가중 평균)
-      - 평균 보호구역 점수 (child 길이 가중 평균)
-    를 계산해서 dict로 반환.
-    """
     total_len = 0.0
     acc_sum = 0.0
     lamp_sum = 0.0
@@ -248,19 +249,12 @@ def compute_route_stats(G: nx.MultiDiGraph, route: list[int]):
 
 
 def pct_change(new: float, base: float):
-    """(new - base) / base * 100. base가 0이면 None."""
     if base == 0:
         return None
     return (new - base) / base * 100.0
 
 
 def format_delta(p: float, positive_is_good: bool):
-    """
-    p: 퍼센트 변화율
-    positive_is_good:
-      - True: 값이 클수록 좋은 지표 (lamp_mean, cctv_mean, child_mean)
-      - False: 값이 작을수록 좋은 지표 (distance, acc_exposure)
-    """
     if p is None or np.isnan(p):
         return "–"
 
@@ -270,6 +264,29 @@ def format_delta(p: float, positive_is_good: bool):
         word = "감소" if p < 0 else "증가"
 
     return f"{abs(p):.1f}% {word}"
+
+
+# ----------------------------------------------------
+# 3-1. 특정 경로에서 속성 요약 (사이드바)
+# ----------------------------------------------------
+def route_attr_summary_streamlit(G, route, label: str):
+    vals = {"lamp": [], "cctv": [], "child": [], "acc": []}
+    for u, v in zip(route[:-1], route[1:]):
+        edge_datas = list(G[u][v].values())
+        data = min(edge_datas, key=lambda d: d.get("length", 0.0))
+        for k in vals.keys():
+            vals[k].append(float(data.get(k, 0.0)))
+
+    st.sidebar.markdown(f"#### 🚶 {label} 경로 속성 요약")
+    for k, lst in vals.items():
+        arr = np.array(lst, dtype=float)
+        if len(arr) == 0:
+            st.sidebar.write(f"{k}: 엣지 없음")
+            continue
+        nonzero = int(np.count_nonzero(arr))
+        st.sidebar.write(
+            f"{k}: 엣지 수 = {len(arr)}, 0이 아닌 엣지 = {nonzero}, 최댓값 = {arr.max():.3f}"
+        )
 
 
 # ----------------------------------------------------
@@ -301,24 +318,18 @@ with col2:
 if st.button("✅ 안전 경로 찾기"):
     with st.spinner("경로 탐색 및 비교 중입니다..."):
         try:
-            # 1) 좌표 → 노드
             orig_latlon = geocode_robust(orig_in)
             dest_latlon = geocode_robust(dest_in)
 
             orig_node = find_nearest_node(orig_latlon[0], orig_latlon[1])
             dest_node = find_nearest_node(dest_latlon[0], dest_latlon[1])
 
-            # 2) 최단 거리 경로
             route_shortest = nx.shortest_path(G, orig_node, dest_node, weight="length")
-
-            # 3) 안전 경로 (cost 기준)
             route_safe = nx.shortest_path(G, orig_node, dest_node, weight="cost")
 
-            # 4) 지도용 좌표
             latlons_short = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in route_shortest]
             latlons_safe = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in route_safe]
 
-            # 5) 지표 계산
             stats_short = compute_route_stats(G, route_shortest)
             stats_safe = compute_route_stats(G, route_safe)
 
@@ -338,6 +349,8 @@ if st.button("✅ 안전 경로 찾기"):
                 "stats_short": stats_short,
                 "stats_safe": stats_safe,
                 "deltas": deltas,
+                "route_shortest": route_shortest,
+                "route_safe": route_safe,
             }
         except nx.NetworkXNoPath:
             st.error("출발지와 도착지 사이에 도보 경로를 찾을 수 없습니다.")
@@ -357,11 +370,12 @@ if st.session_state["route_result"] is not None:
     stats_short = data["stats_short"]
     stats_safe = data["stats_safe"]
     deltas = data["deltas"]
+    route_shortest = data["route_shortest"]
+    route_safe = data["route_safe"]
 
     center_lat, center_lon = latlons_safe[0]
     m = folium.Map(location=[center_lat, center_lon], zoom_start=14)
 
-    # 최단 경로 (회색)
     folium.PolyLine(
         latlons_short,
         weight=4,
@@ -370,7 +384,6 @@ if st.session_state["route_result"] is not None:
         tooltip="최단 거리 경로",
     ).add_to(m)
 
-    # 안전 경로 (파란색)
     folium.PolyLine(
         latlons_safe,
         weight=6,
@@ -384,7 +397,10 @@ if st.session_state["route_result"] is not None:
 
     st_folium(m, width=900, height=600)
 
-    # ---------- 정량 비교 ----------
+    # 👉 이 경로에서 실제로 lamp/cctv/child 엣지를 지나가는지 사이드바에 표시
+    route_attr_summary_streamlit(G, route_shortest, "최단")
+    route_attr_summary_streamlit(G, route_safe, "안전")
+
     st.subheader("📊 최단 경로 vs 안전 경로 정량 비교")
 
     dist_short_km = stats_short["length_m"] / 1000.0
@@ -435,5 +451,3 @@ if st.session_state["route_result"] is not None:
 
 else:
     st.info("출발지와 도착지를 입력하고 **[✅ 안전 경로 찾기]** 버튼을 눌러 주세요.")
-
-
