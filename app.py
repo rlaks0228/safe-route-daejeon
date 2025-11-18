@@ -28,7 +28,7 @@ st.set_page_config(page_title="대전 안전경로 탐색", layout="wide")
 @st.cache_resource
 def load_graph_and_scores():
     # 1) zip 압축 해제
-    zip_path = "safe_graphh.zip"  # 🔹 ZIP 파일 이름만 변경
+    zip_path = "safe_graphh.zip"  # 🔹 여기만 바뀜
     extract_dir = "graphdata"
 
     if not os.path.exists(extract_dir):
@@ -46,24 +46,27 @@ def load_graph_and_scores():
     night = (now.hour >= 18 or now.hour < 6)
 
     if night:
+        # 밤: 조명·CCTV·보호구역을 더 강하게 반영
         wL, wC, wZ = 2.0, 2.0, 2.5
     else:
+        # 낮: 보호구역 중심, 그래도 조명·CCTV는 반영
         wL, wC, wZ = 1.0, 1.0, 2.0
 
     # 4) length 분포 수집
     length_vals = []
-    edges_info = []
+    edges_info = []  # (u,v,k,length,lamp,cctv,child,acc)
 
     for u, v, k, data in G.edges(keys=True, data=True):
-        length = float(data.get("length", 1.0))
+        length = float(data.get("length", 1.0))  # meter
         lamp = float(data.get("lamp", 0.0))
         cctv = float(data.get("cctv", 0.0))
         child = float(data.get("child", 0.0))
-        acc = float(data.get("acc", 0.0))
+        acc = float(data.get("acc", 0.0))  # 현재는 cost에는 사용하지 않지만 통계 계산용으로 남김
 
         length_vals.append(length)
         edges_info.append((u, v, k, length, lamp, cctv, child, acc))
 
+    # 5) 길이 스케일 (너무 짧은/긴 길 bias 방지)
     if len(length_vals) > 0:
         median_len = float(np.median(length_vals))
         if median_len <= 0:
@@ -72,9 +75,15 @@ def load_graph_and_scores():
         median_len = 1.0
 
     # 6) cost 계산
+    #    - 기본: cost ≈ (길이 / 중앙길이) / (1 + wL*lamp + wC*cctv + wZ*child)
+    #    - 조명/ CCTV / 보호구역이 많을수록 cost가 작아져서 선호
     for (u, v, k, length, lamp, cctv, child, acc) in edges_info:
         length_factor = length / median_len
+
+        # 클수록 안전한 점수 (조명/ CCTV / 보호구역만 사용)
         safe_score = wL * lamp + wC * cctv + wZ * child
+
+        # 사고 데이터(acc)는 좌표계 문제로 현재 신뢰하기 어려워 cost에서 제외
         cost = length_factor / (1.0 + safe_score)
 
         G[u][v][k]["cost"] = float(cost)
@@ -88,21 +97,10 @@ def load_graph_and_scores():
 
 G, nodes, nodes_proj = load_graph_and_scores()
 
+
 # ----------------------------------------------------
-# (아래 부분은 동일)
+# 2. 지오코딩 + 최근접 노드
 # ----------------------------------------------------
-
-
-
-# 아래는 위 메시지에서 가져온 그대로이므로 생략
-# -------------------------
-# find_nearest_node
-# compute_route_stats
-# pct_change
-# format_delta
-# UI 구성
-# -------------------------
-
 
 def geocode_kakao(q: str):
     """카카오 로컬 검색 API로 q를 검색해서 최상단 결과의 좌표를 반환."""
@@ -436,5 +434,3 @@ if st.session_state["route_result"] is not None:
 
 else:
     st.info("출발지와 도착지를 입력하고 **[✅ 안전 경로 찾기]** 버튼을 눌러 주세요.")
-
-
