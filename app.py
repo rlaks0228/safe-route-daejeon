@@ -28,7 +28,8 @@ st.set_page_config(page_title="대전 안전경로 탐색", layout="wide")
 @st.cache_resource
 def load_graph_and_scores():
     # 1) zip 압축 해제
-    zip_path = "daejeon_safe_graph.zip"  # 🔹 여기만 바뀜
+    zip_path = "daejeon_safe_graph.zip"
+
     extract_dir = "graphdata"
 
     if not os.path.exists(extract_dir):
@@ -434,4 +435,5 @@ if st.session_state["route_result"] is not None:
 
 else:
     st.info("출발지와 도착지를 입력하고 **[✅ 안전 경로 찾기]** 버튼을 눌러 주세요.")
+
 
