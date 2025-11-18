@@ -24,7 +24,7 @@ st.set_page_config(page_title="대전 안전경로 탐색", layout="wide")
 
 
 # ----------------------------------------------------
-# 1. 그래프 로드 (ZIP → GraphML) + 시간대별 cost, 지표 기준 계산
+# 1. 그래프 로드 (ZIP → GraphML) + “강한” cost 계산
 # ----------------------------------------------------
 @st.cache_resource
 def load_graph_and_scores():
@@ -42,84 +42,61 @@ def load_graph_and_scores():
     graph_path = os.path.join(extract_dir, "daejeon_safe_graph.graphml")
     G = ox.load_graphml(graph_path)
 
-    # 3) 시간대별 가중치로 cost 계산
+    # 3) 시간대별 가중치 설정 (야간일수록 위험 회피 강하게)
     now = datetime.now(pytz.timezone("Asia/Seoul"))
     night = (now.hour >= 18 or now.hour < 6)
 
     if night:
-        # 밤: 밝기 / CCTV / 어린이보호구역 / 사고 가중치 ↑
-        wL, wC, wZ, wA = 1.5, 1.2, 2.0, 1.3
+        # 밤: 조명·CCTV·보호구역 중요 ↑, 사고도 강하게 반영
+        wL, wC, wZ, wA = 2.0, 2.0, 2.5, 6.0
     else:
-        # 낮: 사고보다는 보호구역 중심
-        wL, wC, wZ, wA = 0.7, 1.0, 1.5, 0.8
+        # 낮: 보호구역과 사고 중심, 그래도 조명·CCTV는 반영
+        wL, wC, wZ, wA = 1.0, 1.0, 2.0, 4.0
 
-    # cost 계산 + lamp/cctv/child 값 수집 (지표 기준 계산용)
-    lamp_vals, cctv_vals, child_vals = [], [], []
+    # 4) length, lamp, cctv, child, acc 분포 수집
+    length_vals = []
+    edges_info = []  # (u,v,k,length,lamp,cctv,child,acc)
 
     for u, v, k, data in G.edges(keys=True, data=True):
+        length = float(data.get("length", 1.0))  # meter
         lamp = float(data.get("lamp", 0.0))
         cctv = float(data.get("cctv", 0.0))
         child = float(data.get("child", 0.0))
         acc = float(data.get("acc", 0.0))
 
-        safe = wL * lamp + wC * cctv + wZ * child
-        risk = (1 + wA * acc) / (1 + safe)
+        length_vals.append(length)
+        edges_info.append((u, v, k, length, lamp, cctv, child, acc))
 
-        data["cost"] = float(risk)
+    # 5) 길이 스케일 (너무 짧은/긴 길 bias 방지)
+    if len(length_vals) > 0:
+        median_len = float(np.median(length_vals))
+        if median_len <= 0:
+            median_len = 1.0
+    else:
+        median_len = 1.0
 
-        lamp_vals.append(lamp)
-        cctv_vals.append(cctv)
-        child_vals.append(child)
+    # 6) “강한” cost 계산
+    #    - 기본: cost ≈ (길이 / 중앙길이) * (1 + wA*acc) / (1 + wL*lamp + wC*cctv + wZ*child)
+    #    - acc가 조금만 커도 cost가 확 튀도록 wA를 크게, safe는 분모에 배치
+    for (u, v, k, length, lamp, cctv, child, acc) in edges_info:
+        length_factor = length / median_len
 
-    # 4) 최근접 노드 계산용 노드 GeoDataFrame
+        safe_score = wL * lamp + wC * cctv + wZ * child      # 클수록 안전
+        risk_score = wA * acc                                # 클수록 위험
+
+        # 안정성을 위해 1을 더해 분모/분자 0 회피
+        cost = length_factor * (1.0 + risk_score) / (1.0 + safe_score)
+
+        G[u][v][k]["cost"] = float(cost)
+
+    # 7) 최근접 노드 계산용
     nodes = ox.graph_to_gdfs(G, nodes=True, edges=False)
     nodes_proj = nodes.to_crs(5181)
 
-      # ----------------------------------------------------
-    # 5. 지표 계산을 위한 값 수집
-    # ----------------------------------------------------
-    lamp_vals = []
-    cctv_vals = []
-    child_vals = []
-
-    for u, v, k, data in G.edges(keys=True, data=True):
-        lamp_vals.append(float(data.get("lamp", 0.0)))
-        cctv_vals.append(float(data.get("cctv", 0.0)))
-        child_vals.append(float(data.get("child", 0.0)))
-
-    lamp_vals_arr = np.array(lamp_vals)
-    cctv_vals_arr = np.array(cctv_vals)
-    child_vals_arr = np.array(child_vals)
-
-    # ----------------------------------------------------
-    # 6. 분위수 계산 (0이 아닌 값에서만 분위수 계산하도록 수정)
-    # ----------------------------------------------------
-    lamp_pos = lamp_vals_arr[lamp_vals_arr > 0]
-    cctv_pos = cctv_vals_arr[cctv_vals_arr > 0]
-    child_pos = child_vals_arr[child_vals_arr > 0]
-
-    # 가로등: 값이 있는 edge 중 하위 20%
-    if len(lamp_pos) > 0:
-        lamp_dark_thresh = float(np.quantile(lamp_pos, 0.2))
-    else:
-        lamp_dark_thresh = 0.0
-
-    # CCTV: 값이 있는 edge 중 하위 20%
-    if len(cctv_pos) > 0:
-        cctv_low_thresh = float(np.quantile(cctv_pos, 0.2))
-    else:
-        cctv_low_thresh = 0.0
-
-    # 보호구역: 값이 있는 edge 중 상위 20%
-    if len(child_pos) > 0:
-        child_high_thresh = float(np.quantile(child_pos, 0.8))
-    else:
-        child_high_thresh = 1.0
-
-    return G, nodes, nodes_proj, lamp_dark_thresh, cctv_low_thresh, child_high_thresh
+    return G, nodes, nodes_proj
 
 
-G, nodes, nodes_proj, lamp_dark_thresh, cctv_low_thresh, child_high_thresh = load_graph_and_scores()
+G, nodes, nodes_proj = load_graph_and_scores()
 
 
 # ----------------------------------------------------
@@ -174,7 +151,7 @@ def geocode_robust(q: str):
         return float(a), float(b)
 
     # 2) 카카오맵 검색(한글, 오타, 축약 이름에 강함)
-    lat, lon, place_name = geocode_kakao(q)
+    lat, lon, _ = geocode_kakao(q)
     if lat is not None and lon is not None:
         return lat, lon
 
@@ -207,7 +184,6 @@ def geocode_robust(q: str):
     return 36.351, 127.385
 
 
-
 def find_nearest_node(lat: float, lon: float):
     pt = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(5181).iloc[0]
     dx = nodes_proj.geometry.x - pt.x
@@ -217,33 +193,26 @@ def find_nearest_node(lat: float, lon: float):
 
 
 # ----------------------------------------------------
-# 3. 경로별 지표 계산 함수
+# 3. 경로별 지표 계산 (길이 가중 평균 기반)
 # ----------------------------------------------------
 
-def compute_route_stats(
-    G: nx.MultiDiGraph,
-    route: list[int],
-    lamp_dark_thresh: float,
-    cctv_low_thresh: float,
-    child_high_thresh: float,
-):
+def compute_route_stats(G: nx.MultiDiGraph, route: list[int]):
     """
     한 경로에 대해:
       - 총 길이 (m)
       - 사고 위험 노출도 (acc 길이 가중 평균)
-      - 어두운 구간 비율 (lamp 하위 20%)
-      - CCTV 취약 구간 비율 (cctv 하위 20%)
-      - 어린이 보호구역 인근 비율 (child 상위 20%)
+      - 평균 밝기 (lamp 길이 가중 평균)
+      - 평균 CCTV 밀도 (cctv 길이 가중 평균)
+      - 평균 보호구역 점수 (child 길이 가중 평균)
     를 계산해서 dict로 반환.
     """
     total_len = 0.0
-    acc_weighted_sum = 0.0
-    dark_len = 0.0
-    lowcctv_len = 0.0
-    child_len = 0.0
+    acc_sum = 0.0
+    lamp_sum = 0.0
+    cctv_sum = 0.0
+    child_sum = 0.0
 
     for u, v in zip(route[:-1], route[1:]):
-        # 멀티엣지일 경우, 가장 짧은 엣지 사용
         edge_datas = list(G[u][v].values())
         data = min(edge_datas, key=lambda d: d.get("length", 0.0))
 
@@ -254,30 +223,26 @@ def compute_route_stats(
         acc = float(data.get("acc", 0.0))
 
         total_len += L
-        acc_weighted_sum += acc * L
-
-        if lamp <= lamp_dark_thresh:
-            dark_len += L
-        if cctv <= cctv_low_thresh:
-            lowcctv_len += L
-        if child >= child_high_thresh:
-            child_len += L
+        acc_sum += acc * L
+        lamp_sum += lamp * L
+        cctv_sum += cctv * L
+        child_sum += child * L
 
     if total_len == 0:
         return {
             "length_m": 0.0,
             "acc_exposure": 0.0,
-            "dark_ratio": 0.0,
-            "lowcctv_ratio": 0.0,
-            "child_ratio": 0.0,
+            "lamp_mean": 0.0,
+            "cctv_mean": 0.0,
+            "child_mean": 0.0,
         }
 
     return {
         "length_m": total_len,
-        "acc_exposure": acc_weighted_sum / total_len,
-        "dark_ratio": dark_len / total_len,
-        "lowcctv_ratio": lowcctv_len / total_len,
-        "child_ratio": child_len / total_len,
+        "acc_exposure": acc_sum / total_len,
+        "lamp_mean": lamp_sum / total_len,
+        "cctv_mean": cctv_sum / total_len,
+        "child_mean": child_sum / total_len,
     }
 
 
@@ -288,23 +253,22 @@ def pct_change(new: float, base: float):
     return (new - base) / base * 100.0
 
 
-def format_delta(p: float, positive_is_good: bool = False):
+def format_delta(p: float, positive_is_good: bool):
     """
     p: 퍼센트 변화율
     positive_is_good:
-      - False: 감소가 좋은 경우 (위험/노출)
-      - True: 증가가 좋은 경우 (보호구역 비율 등)
+      - True: 값이 클수록 좋은 지표 (lamp_mean, cctv_mean, child_mean)
+      - False: 값이 작을수록 좋은 지표 (distance, acc_exposure)
     """
-    if p is None:
+    if p is None or np.isnan(p):
         return "–"
 
-    sign_word = ""
     if positive_is_good:
-        sign_word = "증가" if p > 0 else "감소"
+        word = "증가" if p > 0 else "감소"
     else:
-        sign_word = "감소" if p < 0 else "증가"
+        word = "감소" if p < 0 else "증가"
 
-    return f"{abs(p):.1f}% {sign_word}"
+    return f"{abs(p):.1f}% {word}"
 
 
 # ----------------------------------------------------
@@ -314,7 +278,6 @@ st.title("🛡️ 대전 안전경로 탐색기")
 st.write("가로등·CCTV·어린이보호구역·유성구 사고 데이터를 이용해 시간대별 **안전 경로**를 탐색하고,")
 st.write("동일 출발/도착에 대해 **최단 거리 경로와 정량 비교**합니다.")
 
-# 이전 경로 결과 보관
 if "route_result" not in st.session_state:
     st.session_state["route_result"] = None
 
@@ -337,42 +300,33 @@ with col2:
 if st.button("✅ 안전 경로 찾기"):
     with st.spinner("경로 탐색 및 비교 중입니다..."):
         try:
-            # 1) 좌표 → 노드 매핑
+            # 1) 좌표 → 노드
             orig_latlon = geocode_robust(orig_in)
             dest_latlon = geocode_robust(dest_in)
 
             orig_node = find_nearest_node(orig_latlon[0], orig_latlon[1])
             dest_node = find_nearest_node(dest_latlon[0], dest_latlon[1])
 
-            # 2) 최단 거리 경로 (baseline)
+            # 2) 최단 거리 경로
             route_shortest = nx.shortest_path(G, orig_node, dest_node, weight="length")
 
-            # 3) 안전 경로 (우리 모델)
+            # 3) 안전 경로 (강한 cost)
             route_safe = nx.shortest_path(G, orig_node, dest_node, weight="cost")
 
-            # 4) 지도 그리기용 좌표
-            path_nodes_short = [G.nodes[n] for n in route_shortest]
-            latlons_short = [(d["y"], d["x"]) for d in path_nodes_short]
+            # 4) 지도용 좌표
+            latlons_short = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in route_shortest]
+            latlons_safe = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in route_safe]
 
-            path_nodes_safe = [G.nodes[n] for n in route_safe]
-            latlons_safe = [(d["y"], d["x"]) for d in path_nodes_safe]
-
-            # 5) 정량 지표 계산
-            stats_short = compute_route_stats(
-                G, route_shortest,
-                lamp_dark_thresh, cctv_low_thresh, child_high_thresh
-            )
-            stats_safe = compute_route_stats(
-                G, route_safe,
-                lamp_dark_thresh, cctv_low_thresh, child_high_thresh
-            )
+            # 5) 지표 계산
+            stats_short = compute_route_stats(G, route_shortest)
+            stats_safe = compute_route_stats(G, route_safe)
 
             deltas = {
                 "distance_pct": pct_change(stats_safe["length_m"], stats_short["length_m"]),
                 "acc_exposure_pct": pct_change(stats_safe["acc_exposure"], stats_short["acc_exposure"]),
-                "dark_ratio_pct": pct_change(stats_safe["dark_ratio"], stats_short["dark_ratio"]),
-                "lowcctv_ratio_pct": pct_change(stats_safe["lowcctv_ratio"], stats_short["lowcctv_ratio"]),
-                "child_ratio_pct": pct_change(stats_safe["child_ratio"], stats_short["child_ratio"]),
+                "lamp_mean_pct": pct_change(stats_safe["lamp_mean"], stats_short["lamp_mean"]),
+                "cctv_mean_pct": pct_change(stats_safe["cctv_mean"], stats_short["cctv_mean"]),
+                "child_mean_pct": pct_change(stats_safe["child_mean"], stats_short["child_mean"]),
             }
 
             st.session_state["route_result"] = {
@@ -391,7 +345,7 @@ if st.button("✅ 안전 경로 찾기"):
 
 
 # ----------------------------------------------------
-# 5. 지도 표시 + 지표 출력
+# 5. 지도 + 정량 지표 출력
 # ----------------------------------------------------
 if st.session_state["route_result"] is not None:
     data = st.session_state["route_result"]
@@ -403,12 +357,10 @@ if st.session_state["route_result"] is not None:
     stats_safe = data["stats_safe"]
     deltas = data["deltas"]
 
-    # 지도 중심: 안전 경로 첫 지점 기준
     center_lat, center_lon = latlons_safe[0]
-
     m = folium.Map(location=[center_lat, center_lon], zoom_start=14)
 
-    # (1) 최단 거리 경로 – 회색
+    # 최단 경로 (회색)
     folium.PolyLine(
         latlons_short,
         weight=4,
@@ -417,7 +369,7 @@ if st.session_state["route_result"] is not None:
         tooltip="최단 거리 경로",
     ).add_to(m)
 
-    # (2) 안전 경로 – 파란색 (위에 덮어서 강조)
+    # 안전 경로 (파란색)
     folium.PolyLine(
         latlons_safe,
         weight=6,
@@ -426,59 +378,46 @@ if st.session_state["route_result"] is not None:
         tooltip="안전 경로",
     ).add_to(m)
 
-    # (3) 출발 / 도착
     folium.Marker(orig_latlon, popup="출발지").add_to(m)
     folium.Marker(dest_latlon, popup="도착지").add_to(m)
 
     st_folium(m, width=900, height=600)
 
-    # ------------------------
-    # 정량 지표 표/설명 출력
-    # ------------------------
+    # ---------- 정량 비교 ----------
     st.subheader("📊 최단 경로 vs 안전 경로 정량 비교")
 
-    # 단위 변환
     dist_short_km = stats_short["length_m"] / 1000.0
     dist_safe_km = stats_safe["length_m"] / 1000.0
 
-    # 비율 → %
-    dark_short_pct = stats_short["dark_ratio"] * 100
-    dark_safe_pct = stats_safe["dark_ratio"] * 100
-    lowcctv_short_pct = stats_short["lowcctv_ratio"] * 100
-    lowcctv_safe_pct = stats_safe["lowcctv_ratio"] * 100
-    child_short_pct = stats_short["child_ratio"] * 100
-    child_safe_pct = stats_safe["child_ratio"] * 100
-
-    # 간단한 표 형태로 정리
     df = pd.DataFrame(
         {
             "지표": [
                 "이동 거리 (km)",
                 "사고 위험 노출도 (acc, 길이 가중 평균)",
-                "어두운 구간 비율 (lamp 하위 20%)",
-                "CCTV 취약 구간 비율 (cctv 하위 20%)",
-                "보호구역 인근 비율 (child 상위 20%)",
+                "평균 밝기 (lamp, 길이 가중 평균)",
+                "평균 CCTV 밀도 (cctv, 길이 가중 평균)",
+                "평균 보호구역 점수 (child, 길이 가중 평균)",
             ],
             "최단 경로": [
                 f"{dist_short_km:.2f}",
                 f"{stats_short['acc_exposure']:.3f}",
-                f"{dark_short_pct:.1f}%",
-                f"{lowcctv_short_pct:.1f}%",
-                f"{child_short_pct:.1f}%",
+                f"{stats_short['lamp_mean']:.3f}",
+                f"{stats_short['cctv_mean']:.3f}",
+                f"{stats_short['child_mean']:.3f}",
             ],
             "안전 경로": [
                 f"{dist_safe_km:.2f}",
                 f"{stats_safe['acc_exposure']:.3f}",
-                f"{dark_safe_pct:.1f}%",
-                f"{lowcctv_safe_pct:.1f}%",
-                f"{child_safe_pct:.1f}%",
+                f"{stats_safe['lamp_mean']:.3f}",
+                f"{stats_safe['cctv_mean']:.3f}",
+                f"{stats_safe['child_mean']:.3f}",
             ],
             "변화율 (최단 → 안전)": [
                 format_delta(deltas["distance_pct"], positive_is_good=False),
                 format_delta(deltas["acc_exposure_pct"], positive_is_good=False),
-                format_delta(deltas["dark_ratio_pct"], positive_is_good=False),
-                format_delta(deltas["lowcctv_ratio_pct"], positive_is_good=False),
-                format_delta(deltas["child_ratio_pct"], positive_is_good=True),
+                format_delta(deltas["lamp_mean_pct"], positive_is_good=True),
+                format_delta(deltas["cctv_mean_pct"], positive_is_good=True),
+                format_delta(deltas["child_mean_pct"], positive_is_good=True),
             ],
         }
     )
@@ -487,15 +426,11 @@ if st.session_state["route_result"] is not None:
 
     st.markdown(
         """
-        - **이동 거리**: 안전 경로가 얼마나 더 걷는지 / 덜 걷는지  
-        - **사고 위험 노출도**: 교통사고 기반 acc 점수를 길이로 가중 평균한 값  
-        - **어두운 구간 비율**: 전체 경로 중 조명이 상대적으로 부족한 구간 비율  
-        - **CCTV 취약 구간 비율**: CCTV 밀도가 낮은 구간 비율  
-        - **보호구역 인근 비율**: 어린이 보호구역·학교 인근을 따라 걷는 비율 (높을수록 좋음)
+        - **이동 거리**: 안전 경로가 최단 경로보다 얼마나 더/덜 걷는지  
+        - **사고 위험 노출도**: edge별 acc 값을 길이로 가중 평균한 값 (작을수록 안전)  
+        - **평균 밝기 / CCTV / 보호구역 점수**: 값이 클수록 청소년에게 더 안전한 환경에 가깝다는 뜻  
         """
     )
 
 else:
     st.info("출발지와 도착지를 입력하고 **[✅ 안전 경로 찾기]** 버튼을 눌러 주세요.")
-
-
