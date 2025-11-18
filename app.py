@@ -15,6 +15,8 @@ from geopy.geocoders import Nominatim
 from streamlit_folium import st_folium
 import zipfile
 import os
+import requests
+
 
 warnings.filterwarnings("ignore")
 
@@ -75,7 +77,32 @@ G, nodes, nodes_proj = load_graph_and_scores()
 # ----------------------------------------------------
 # 2. 지오코딩 + 최근접 노드
 # ----------------------------------------------------
-geocode = Nominatim(user_agent="safe_route_daejeon").geocode
+
+def geocode_kakao(q: str):
+    """카카오 로컬 검색 API로 q를 검색해서 최상단 결과의 좌표를 반환."""
+    try:
+        url = "https://dapi.kakao.com/v2/local/search/keyword.json"
+        headers = {"Authorization": f"KakaoAK {st.secrets['KAKAO_REST_KEY']}"}
+        params = {
+            "query": q,
+            "size": 1,   # 최상단 1개만
+        }
+        r = requests.get(url, headers=headers, params=params, timeout=3)
+        r.raise_for_status()
+        data = r.json()
+        docs = data.get("documents", [])
+        if not docs:
+            return None, None, None
+
+        doc = docs[0]
+        lat = float(doc["y"])
+        lon = float(doc["x"])
+        place_name = doc["place_name"]
+        return lat, lon, place_name
+    except Exception:
+        return None, None, None
+
+geocode = Nominatim(user_agent="safe_route_daejeon", timeout=3).geocode
 
 
 def is_latlon(s: str) -> bool:
@@ -92,22 +119,35 @@ def is_latlon(s: str) -> bool:
 
 def geocode_robust(q: str):
     q = q.strip()
-    # 1) "36.35, 127.38" 형태 숫자면 바로 파싱
+
+    # 1) "36.35, 127.38" 형태면 바로 숫자로 처리
     if is_latlon(q):
         a, b = q.split(",", 1)
         return float(a), float(b)
 
-    # 2) 그대로 지오코딩 시도
-    loc = geocode(q)
+    # 2) 카카오맵 검색(한글, 오타, 축약 이름에 강함)
+    lat, lon, place_name = geocode_kakao(q)
+    if lat is not None and lon is not None:
+        # st.toast(f"카카오맵에서 '{place_name}'을(를) 찾았어요.")  # 원하면 사용
+        return lat, lon
+
+    # 3) geopy Nominatim (OSM) 시도 – 실패해도 조용히 넘어감
+    try:
+        loc = geocode(q)
+    except Exception:
+        loc = None
     if loc:
         return loc.latitude, loc.longitude
 
-    # 3) 대전 붙여서 다시 시도
-    loc = geocode(f"{q}, Daejeon, South Korea")
+    # 4) "대전, 한국" 붙여서 다시 시도
+    try:
+        loc = geocode(f"{q}, Daejeon, South Korea")
+    except Exception:
+        loc = None
     if loc:
         return loc.latitude, loc.longitude
 
-    # 4) osmnx geocode_to_gdf 사용
+    # 5) osmnx geocode_to_gdf – 마지막 시도
     try:
         gdf = ox.geocode_to_gdf(f"{q}, Daejeon, South Korea")
         if len(gdf):
@@ -116,8 +156,9 @@ def geocode_robust(q: str):
     except Exception:
         pass
 
-    # 5) 완전 실패하면 대전 중심 좌표
+    # 6) 완전 실패하면 대전 중심
     return 36.351, 127.385
+
 
 
 def find_nearest_node(lat: float, lon: float):
@@ -198,3 +239,4 @@ if st.session_state["route_result"] is not None:
     st_folium(m, width=900, height=600)
 else:
     st.info("출발지와 도착지를 입력하고 **[✅ 안전 경로 찾기]** 버튼을 눌러 주세요.")
+
