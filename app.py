@@ -75,31 +75,46 @@ def load_graph_and_scores():
     nodes = ox.graph_to_gdfs(G, nodes=True, edges=False)
     nodes_proj = nodes.to_crs(5181)
 
-   lamp_vals_arr = np.array(lamp_vals)
-cctv_vals_arr = np.array(cctv_vals)
-child_vals_arr = np.array(child_vals)
+      # ----------------------------------------------------
+    # 5. 지표 계산을 위한 값 수집
+    # ----------------------------------------------------
+    lamp_vals = []
+    cctv_vals = []
+    child_vals = []
 
-# 0이 아닌 값만 따로 뽑아서 분위수 계산
-lamp_pos = lamp_vals_arr[lamp_vals_arr > 0]
-cctv_pos = cctv_vals_arr[cctv_vals_arr > 0]
-child_pos = child_vals_arr[child_vals_arr > 0]
+    for u, v, k, data in G.edges(keys=True, data=True):
+        lamp_vals.append(float(data.get("lamp", 0.0)))
+        cctv_vals.append(float(data.get("cctv", 0.0)))
+        child_vals.append(float(data.get("child", 0.0)))
 
-# 가로등/ CCTV: 값이 있는 edge들 중 하위 20%를 "취약" 기준으로
-if len(lamp_pos) > 0:
-    lamp_dark_thresh = float(np.quantile(lamp_pos, 0.2))
-else:
-    lamp_dark_thresh = 0.0
+    lamp_vals_arr = np.array(lamp_vals)
+    cctv_vals_arr = np.array(cctv_vals)
+    child_vals_arr = np.array(child_vals)
 
-if len(cctv_pos) > 0:
-    cctv_low_thresh = float(np.quantile(cctv_pos, 0.2))
-else:
-    cctv_low_thresh = 0.0
+    # ----------------------------------------------------
+    # 6. 분위수 계산 (0이 아닌 값에서만 분위수 계산하도록 수정)
+    # ----------------------------------------------------
+    lamp_pos = lamp_vals_arr[lamp_vals_arr > 0]
+    cctv_pos = cctv_vals_arr[cctv_vals_arr > 0]
+    child_pos = child_vals_arr[child_vals_arr > 0]
 
-# 보호구역: 값이 있는 edge들 중 상위 20%를 "인근"으로
-if len(child_pos) > 0:
-    child_high_thresh = float(np.quantile(child_pos, 0.8))
-else:
-    child_high_thresh = 1.0
+    # 가로등: 값이 있는 edge 중 하위 20%
+    if len(lamp_pos) > 0:
+        lamp_dark_thresh = float(np.quantile(lamp_pos, 0.2))
+    else:
+        lamp_dark_thresh = 0.0
+
+    # CCTV: 값이 있는 edge 중 하위 20%
+    if len(cctv_pos) > 0:
+        cctv_low_thresh = float(np.quantile(cctv_pos, 0.2))
+    else:
+        cctv_low_thresh = 0.0
+
+    # 보호구역: 값이 있는 edge 중 상위 20%
+    if len(child_pos) > 0:
+        child_high_thresh = float(np.quantile(child_pos, 0.8))
+    else:
+        child_high_thresh = 1.0
 
     return G, nodes, nodes_proj, lamp_dark_thresh, cctv_low_thresh, child_high_thresh
 
@@ -482,4 +497,5 @@ if st.session_state["route_result"] is not None:
 
 else:
     st.info("출발지와 도착지를 입력하고 **[✅ 안전 경로 찾기]** 버튼을 눌러 주세요.")
+
 
