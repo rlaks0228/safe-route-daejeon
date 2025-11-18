@@ -17,14 +17,13 @@ import zipfile
 import os
 import requests
 
-
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="대전 안전경로 탐색", layout="wide")
 
 
 # ----------------------------------------------------
-# 1. 그래프 로드 (ZIP → GraphML) + “강한” cost 계산
+# 1. 그래프 로드 (ZIP → GraphML) + cost 계산
 # ----------------------------------------------------
 @st.cache_resource
 def load_graph_and_scores():
@@ -42,18 +41,18 @@ def load_graph_and_scores():
     graph_path = os.path.join(extract_dir, "daejeon_safe_graph.graphml")
     G = ox.load_graphml(graph_path)
 
-    # 3) 시간대별 가중치 설정 (야간일수록 위험 회피 강하게)
+    # 3) 시간대별 가중치 설정 (야간일수록 안전 요소를 더 강하게)
     now = datetime.now(pytz.timezone("Asia/Seoul"))
     night = (now.hour >= 18 or now.hour < 6)
 
     if night:
-        # 밤: 조명·CCTV·보호구역 중요 ↑, 사고도 강하게 반영
-        wL, wC, wZ, wA = 2.0, 2.0, 2.5, 6.0
+        # 밤: 조명·CCTV·보호구역을 더 강하게 반영
+        wL, wC, wZ = 2.0, 2.0, 2.5
     else:
-        # 낮: 보호구역과 사고 중심, 그래도 조명·CCTV는 반영
-        wL, wC, wZ, wA = 1.0, 1.0, 2.0, 4.0
+        # 낮: 보호구역 중심, 그래도 조명·CCTV는 반영
+        wL, wC, wZ = 1.0, 1.0, 2.0
 
-    # 4) length, lamp, cctv, child, acc 분포 수집
+    # 4) length 분포 수집
     length_vals = []
     edges_info = []  # (u,v,k,length,lamp,cctv,child,acc)
 
@@ -62,7 +61,7 @@ def load_graph_and_scores():
         lamp = float(data.get("lamp", 0.0))
         cctv = float(data.get("cctv", 0.0))
         child = float(data.get("child", 0.0))
-        acc = float(data.get("acc", 0.0))
+        acc = float(data.get("acc", 0.0))  # 현재는 cost에는 사용하지 않지만 통계 계산용으로 남김
 
         length_vals.append(length)
         edges_info.append((u, v, k, length, lamp, cctv, child, acc))
@@ -75,17 +74,17 @@ def load_graph_and_scores():
     else:
         median_len = 1.0
 
-    # 6) “강한” cost 계산
-    #    - 기본: cost ≈ (길이 / 중앙길이) * (1 + wA*acc) / (1 + wL*lamp + wC*cctv + wZ*child)
-    #    - acc가 조금만 커도 cost가 확 튀도록 wA를 크게, safe는 분모에 배치
+    # 6) cost 계산
+    #    - 기본: cost ≈ (길이 / 중앙길이) / (1 + wL*lamp + wC*cctv + wZ*child)
+    #    - 조명/ CCTV / 보호구역이 많을수록 cost가 작아져서 선호
     for (u, v, k, length, lamp, cctv, child, acc) in edges_info:
         length_factor = length / median_len
 
-        safe_score = wL * lamp + wC * cctv + wZ * child      # 클수록 안전
-        risk_score = wA * acc                                # 클수록 위험
+        # 클수록 안전한 점수 (조명/ CCTV / 보호구역만 사용)
+        safe_score = wL * lamp + wC * cctv + wZ * child
 
-        # 안정성을 위해 1을 더해 분모/분자 0 회피
-        cost = length_factor * (1.0 + risk_score) / (1.0 + safe_score)
+        # 사고 데이터(acc)는 좌표계 문제로 현재 신뢰하기 어려워 cost에서 제외
+        cost = length_factor / (1.0 + safe_score)
 
         G[u][v][k]["cost"] = float(cost)
 
@@ -126,6 +125,7 @@ def geocode_kakao(q: str):
         return lat, lon, place_name
     except Exception:
         return None, None, None
+
 
 geocode = Nominatim(user_agent="safe_route_daejeon", timeout=3).geocode
 
@@ -275,7 +275,7 @@ def format_delta(p: float, positive_is_good: bool):
 # 4. Streamlit UI
 # ----------------------------------------------------
 st.title("🛡️ 대전 안전경로 탐색기")
-st.write("가로등·CCTV·어린이보호구역·유성구 사고 데이터를 이용해 시간대별 **안전 경로**를 탐색하고,")
+st.write("가로등·CCTV·어린이보호구역 데이터를 이용해 시간대별 **안전 경로**를 탐색하고,")
 st.write("동일 출발/도착에 대해 **최단 거리 경로와 정량 비교**합니다.")
 
 if "route_result" not in st.session_state:
@@ -310,7 +310,7 @@ if st.button("✅ 안전 경로 찾기"):
             # 2) 최단 거리 경로
             route_shortest = nx.shortest_path(G, orig_node, dest_node, weight="length")
 
-            # 3) 안전 경로 (강한 cost)
+            # 3) 안전 경로 (cost 기준)
             route_safe = nx.shortest_path(G, orig_node, dest_node, weight="cost")
 
             # 4) 지도용 좌표
@@ -427,7 +427,7 @@ if st.session_state["route_result"] is not None:
     st.markdown(
         """
         - **이동 거리**: 안전 경로가 최단 경로보다 얼마나 더/덜 걷는지  
-        - **사고 위험 노출도**: edge별 acc 값을 길이로 가중 평균한 값 (작을수록 안전)  
+        - **사고 위험 노출도**: edge별 acc 값을 길이로 가중 평균한 값 (현재 그래프에서는 0으로만 구성됨)  
         - **평균 밝기 / CCTV / 보호구역 점수**: 값이 클수록 청소년에게 더 안전한 환경에 가깝다는 뜻  
         """
     )
